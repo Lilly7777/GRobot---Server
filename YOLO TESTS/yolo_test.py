@@ -1,24 +1,17 @@
-from ctypes import *                                               # Import libraries
+from ctypes import *                                               
 import math
 import random
 import os
 import cv2
 import numpy as np
 import time
-from imutils import build_montages
-from datetime import datetime
-import imagezmq
+from sort import *
+import sys
+from Darknet.darknet.build.darknet.x64 import darknet
 import argparse
-import imutils
-from config import *
 from AreaBorder import AreaBorder
 from ActionController import ActionController
-from grobotUtils import *
-from Darknet.darknet.build.darknet.x64 import darknet
-import scipy.misc
-from PIL import Image as im 
-
-
+#from kalmantest import center
 
 
 kalman = cv2.KalmanFilter(4, 2)
@@ -43,22 +36,98 @@ s_upper = 255
 v_lower = 32
 v_upper = 255
 
+frame_width = 640                                  # Returns the width and height of capture video
+frame_height = 480
+max_sector_offset = 30
+left_border = AreaBorder('vertical', frame_width/2 - max_sector_offset, 1)
+right_border = AreaBorder('vertical', frame_width/2 + max_sector_offset, 1)
+
+def center(points):
+    x = np.float32(
+        (points[0][0] +
+         points[1][0] +
+         points[2][0] +
+         points[3][0]) /
+        4.0)
+    y = np.float32(
+        (points[0][1] +
+         points[1][1] +
+         points[2][1] +
+         points[3][1]) /
+        4.0)
+    return np.array([np.float32(x), np.float32(y)], np.float32)
+
 boxes = []
 tracking = False
 
 term_crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 1)
+
+def find_closest(dets,b):
+    centers = [[int(det[2][0]+det[2][2]/2), int(det[2][1] + det[2][3]/2)] for det in dets]
+    min_distance = None
+    curr_det_id = 0
+    det_id = 0 
+    for center in centers:
+        if min_distance == None:
+            min_distance = math.sqrt( (center[0] - ( b[0][0] + (b[1][0]-b[0][0]) /2 ))**2 + (center[1] - (b[0][1] + (b[1][1]-b[1][1]) /2))**2 )
+            det_id=curr_det_id
+            curr_det_id+=1
+            continue
+        curr_distance = math.sqrt( (center[0] - ( b[0][0] + (b[1][0]-b[0][0]) /2 ))**2 + (center[1] - (b[0][1] + (b[1][1]-b[1][1]) /2))**2 )
+        if curr_distance < min_distance:
+            min_distance = curr_distance
+            det_id=curr_det_id
+        curr_det_id+=1
+    print(det_id)
+    return dets[det_id]
+
+
+def convertBack(x, y, w, h):
+    xmin = int(round(x - (w / 2)))
+    xmax = int(round(x + (w / 2)))
+    ymin = int(round(y - (h / 2)))
+    ymax = int(round(y + (h / 2)))
+    return xmin, ymin, xmax, ymax
+
+def cvDrawBoxes(detections, img):
+    # Colored labels dictionary
+    color_dict = {
+        'Tin can' : [0, 255, 255], 'Bottle': [238, 123, 158]
+    }
+    
+    for label, confidence, bbox in detections:
+        x, y, w, h = (bbox[0],
+            bbox[1],
+            bbox[2],
+            bbox[3])
+        name_tag = label
+        for name_key, color_val in color_dict.items():
+            if name_key == name_tag:
+                color = color_val 
+                xmin, ymin, xmax, ymax = convertBack(
+                float(x), float(y), float(w), float(h))
+                pt1 = (xmin, ymin)
+                pt2 = (xmax, ymax)
+                cv2.rectangle(img, pt1, pt2, color, 1)
+                cv2.putText(img,
+                            name_tag +
+                            " [" + confidence + "]",
+                            (pt1[0], pt1[1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                            color, 2)
+    return img
+
 
 netMain = None
 metaMain = None
 altNames = None
 
 def YOLO():
-    pickup_timer = 0
-    global metaMain, netMain, altNames, boxes, tracking, prediction
+   
+    global metaMain, netMain, altNames, boxes
     configPath = "yolov4-obj.cfg"                                 # Path to cfg
     weightPath = "yolov4-obj_last.weights"                                 # Path to weights
     metaPath = "obj.data"                                    # Path to meta data
-
+    mot_tracker = Sort() 
     network, class_names, class_colors = darknet.load_network(configPath,  metaPath, weightPath, batch_size=1)
 
     if not os.path.exists(configPath):                              # Checks whether file exists otherwise return ValueError
@@ -75,56 +144,40 @@ def YOLO():
             "ascii"), weightPath.encode("ascii"), 0, 1)             # batch size = 1
     if metaMain is None:
         metaMain = darknet.load_meta(metaPath.encode("ascii"))
+    if altNames is None:
+        try:
+            with open(metaPath) as metaFH:
+                metaContents = metaFH.read()
+                import re
+                match = re.search("names *= *(.*)$", metaContents,
+                                  re.IGNORECASE | re.MULTILINE)
+                if match:
+                    result = match.group(1)
+                else:
+                    result = None
+                try:
+                    if os.path.exists(result):
+                        with open(result) as namesFH:
+                            namesList = namesFH.read().strip().split("\n")
+                            altNames = [x.strip() for x in namesList]
+                except TypeError:
+                    pass
+        except Exception:
+            pass
+    cap = cv2.VideoCapture(0)                                    
+    frame_width = int(cap.get(3))
+    frame_height = int(cap.get(4))
 
-    picked_up = 0
-    imageHub = imagezmq.ImageHub()
-    frameDict = {}
-    lastActive = {}
-    pickedUp = {}
-    lastActiveCheck = datetime.now()
-
-    ESTIMATED_NUM_PIS = 4
-    ACTIVE_CHECK_PERIOD = 10
-    ACTIVE_CHECK_SECONDS = ESTIMATED_NUM_PIS * ACTIVE_CHECK_PERIOD
-
-    mW = 2
-    mH = 2
-    
-    max_sector_offset = 30
-
-
-    action_controller = ActionController()
-
-    cv2.namedWindow("Preview")
     print("Starting the YOLO loop...")
-    frame_width = 640
-    frame_height = 480
+
     # Create an image we reuse for each detect
-    darknet_image = darknet.make_image(640, 480, 3) # Create image according darknet for compatibility of network
+    darknet_image = darknet.make_image(frame_width, frame_height, 3) # Create image according darknet for compatibility of network
     while True:                                                      # Load the input frame and write output frame.
         prev_time = time.time()
-        pickup_timer+=1
-        (rpiName, frame_read) = imageHub.recv_image()
-
-        left_border = AreaBorder('vertical', frame_width/2 - max_sector_offset, 1)
-        right_border = AreaBorder('vertical', frame_width/2 + max_sector_offset, 1)
-        # if a device is not in the last active dictionary then it means
-        # that its a newly connected device
-        if rpiName not in lastActive.keys():
-            print("receiving data from {}...".format(rpiName))
-        
-        # record the last active time for the device from which we just
-        lastActive[rpiName] = datetime.now()
-
-        if (datetime.now() - lastActiveCheck).seconds > ACTIVE_CHECK_SECONDS:
-            for (rpiName, ts) in list(lastActive.items()):
-                # remove the RPi from the last active and frame
-                # dictionaries if the device hasn't been active recently
-                if (datetime.now() - ts).seconds > ACTIVE_CHECK_SECONDS:
-                    print("lost connection to {}".format(rpiName))
-                    lastActive.pop(rpiName)
-                    frameDict.pop(rpiName)
-            lastActiveCheck = datetime.now()
+        ret, frame_read = cap.read()                                 # Capture frame and return true if frame present
+        # For Assertion Failed Error in OpenCV
+        if not ret:                                                  # Check if frame present otherwise he break the while loop
+            break
 
         frame_rgb = cv2.cvtColor(frame_read, cv2.COLOR_BGR2RGB)      # Convert frame into RGB from BGR and resize accordingly
         frame_resized = cv2.resize(frame_rgb,
@@ -132,28 +185,22 @@ def YOLO():
                                    interpolation=cv2.INTER_LINEAR)
 
         darknet.copy_image_from_bytes(darknet_image,frame_resized.tobytes())                # Copy that frame bytes to darknet_image
+
         detections = darknet.detect_image(network, class_names, darknet_image, thresh=0.25)    # Detection occurs at this line and return detections, for customize we can change the threshold.                                                                                   
-        custom_detections = []
-        for det in detections:
-            if det[0] in robots[rpiName]["targets"]:
-                custom_detections.append(det)
-        print(len(custom_detections))
-        custom_detections = tuple(custom_detections)
-        print(len(custom_detections))
-        if len(custom_detections):
-            for det in custom_detections:
-                if det[0] in robots[rpiName]["targets"]:
-                    print(det[0])
-                    if len(boxes)<1: #if not found or closer
-                        boxes.append([int(det[2][0]), int(det[2][1])])
-                        boxes.append([int(det[2][0]+det[2][1]), int(det[2][1]+ det[2][3])])
-                    else:
-                        
-                        last_track = find_closest(custom_detections, boxes)
-                        xmin, ymin, xmax, ymax = convertBack(last_track[2][0],last_track[2][1],last_track[2][2],last_track[2][3])
-                        boxes = []
-                        boxes.append([int(xmin), int(ymin)])
-                        boxes.append([int(xmax), int(ymax)])
+        #print(detections)
+        #print(boxes)
+        if len(detections):
+            for det in detections:
+                if len(boxes)<1: #if not found or closer
+                    boxes.append([int(det[2][0]), int(det[2][1])])
+                    boxes.append([int(det[2][0]+det[2][1]), int(det[2][1]+ det[2][3])])
+                else:
+                    
+                    last_track = find_closest(detections, boxes)
+                    boxes = []
+                    boxes.append([int(last_track[2][0]), int(last_track[2][1])])
+                    boxes.append([int(last_track[2][0]+last_track[2][1]), int(last_track[2][1]+ last_track[2][3])])
+                    print(boxes)
 
         if (len(boxes) > 1) and (boxes[0][1] < boxes[1][1]) and (
                 boxes[0][0] < boxes[1][0]):
@@ -176,7 +223,9 @@ def YOLO():
                         (0., float(s_lower), float(v_lower))), np.array(
                         (180., float(s_upper), float(v_upper))))
 
-                # construct a histogram of hue and saturation values and normalize it
+                # construct a histogram of hue and saturation values and
+                # normalize it
+
                 crop_hist = cv2.calcHist(
                     [hsv_crop], [
                         0, 1], mask, [
@@ -185,6 +234,7 @@ def YOLO():
                 cv2.normalize(crop_hist, crop_hist, 0, 255, cv2.NORM_MINMAX)
 
                 # set intial position of object
+
                 track_window = (
                     boxes[0][0],
                     boxes[0][1],
@@ -192,13 +242,18 @@ def YOLO():
                     boxes[0][0],
                     boxes[1][1] -
                     boxes[0][1])
-        
-        if tracking:
+
+                
+
+            # reset list of boxes
+            #boxes = []
+        if (tracking):
 
             # convert incoming image to HSV
             img_hsv = cv2.cvtColor(frame_read, cv2.COLOR_BGR2HSV)
 
             # back projection of histogram based on Hue and Saturation only
+
             img_bproject = cv2.calcBackProject(
                 [img_hsv], [
                     0, 1], crop_hist, [
@@ -208,12 +263,13 @@ def YOLO():
             ret, track_window = cv2.CamShift(
                 img_bproject, track_window, term_crit)
 
-            # draw observation on image
+            # draw observation on image - in BLUE
             x, y, w, h = track_window
             frame_resized = cv2.rectangle(
                 frame_resized, (x, y), (x + w, y + h), (255, 0, 0), 2)
 
             # extract centre of this observation as points
+
             pts = cv2.boxPoints(ret)
             pts = np.int0(pts)
             # (cx, cy), radius = cv2.minEnclosingCircle(pts)
@@ -231,51 +287,27 @@ def YOLO():
                                    int(prediction[1] + (0.5 * h))),
                                   (0,255,0),2)
 
-        if len(boxes)>0:     
-            msg = ""   
-            if prediction[0]<left_border.max_offset:
-                msg = "LEFT "+str(abs(int(frame_width/2 - prediction[0])))
-            elif (prediction[0]>right_border.max_offset):
-                msg = "RIGHT " + str(abs(int(frame_width/2 - prediction[0])))
-            else:
-                
-                if boxes[0][1] + (boxes[1][1] - boxes[0][1])/2 >(frame_height//4)*3:
-                    msg = "PICKUP 0"
-                    if pickup_timer>50:
-                        picked_up+=1
-                    pickup_timer=0
-                else:
-                    msg = "FORWARD " + str(abs(int(frame_height - prediction[1])))
+        
+        if(prediction[0]<left_border.max_offset):
+            print("LEFT")
+        elif (prediction[0]>right_border.max_offset):
+            print("RIGHT")
         else:
-            msg = "IDLE 0"
-
-        #print(msg)
-        imageHub.send_reply(msg.encode('ascii'))
+            print("FORWARD")
         
         
         image = cvDrawBoxes(detections, frame_resized)               # Call the function cvDrawBoxes() for colored bounding box per class
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        
         cv2.line(image, (left_border.max_offset, 0), (left_border.max_offset, frame_height), (0, 255, 0), thickness=2)
         cv2.line(image, (right_border.max_offset, 0), (right_border.max_offset, frame_height), (255, 0, 0), thickness=2)
-        frameDict[rpiName] = image
-        # build a montage using images in the frame dictionary
-        (h, w) = image.shape[:2]
-        montages = build_montages(frameDict.values(), (w, h), (mW, mH))
-        
-        # display the montage(s) on the screen
-        cv2.putText(image, rpiName, (10, 25),cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-        #cv2.imshow('Preview', image)
-        for (i, montage) in enumerate(montages):
-            cv2.imshow("Preview",
-                image)
-
+        #cv2.line(image, (x_pos, y), (x_pos, y + h), (0, 0, 255), thickness=2)
         #print(1/(time.time()-prev_time))
-
-        # if the `q` key was pressed, break from the loop
-        if cv2.waitKey(1) & 0xFF == ord('q'): break
-    
-                                                                   # For releasing cap and out. 
+        cv2.imshow('Demo', image)                                    # Display Image window
+        cv2.waitKey(3)
+        #out.write(image)                                             # Write that frame into output video
+    cap.release()                                                    # For releasing cap and out. 
+    #out.release()
+    print(":::Video Write Completed")
 
 if __name__ == "__main__":  
     YOLO()                                                           # Calls the main function YOLO()

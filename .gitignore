@@ -6,6 +6,9 @@ __pycache__/
 # C extensions
 *.so
 
+# YOLOv4 Weight files
+.weights
+
 # Distribution / packaging
 .Python
 build/
