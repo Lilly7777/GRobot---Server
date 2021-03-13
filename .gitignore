@@ -8,6 +8,10 @@ __pycache__/
 
 # YOLOv4 Weight files
 .weights
+yolov4-grobot.weights
+YOLO TESTS/yolov4-grobot.weights
+
+
 
 # Distribution / packaging
 .Python
