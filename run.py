@@ -18,9 +18,6 @@ from Darknet.darknet.build.darknet.x64 import darknet
 import scipy.misc
 from PIL import Image as im 
 
-
-
-
 kalman = cv2.KalmanFilter(4, 2)
 kalman.measurementMatrix = np.array([[1, 0, 0, 0],
                                      [0, 1, 0, 0]], np.float32)
@@ -56,7 +53,7 @@ def YOLO():
     pickup_timer = 0
     global metaMain, netMain, altNames, boxes, tracking, prediction
     configPath = "yolov4-obj.cfg"                                 # Path to cfg
-    weightPath = "yolov4-obj_last.weights"                                 # Path to weights
+    weightPath = "yolov4-grobot.weights"                                 # Path to weights
     metaPath = "obj.data"                                    # Path to meta data
 
     network, class_names, class_colors = darknet.load_network(configPath,  metaPath, weightPath, batch_size=1)
@@ -76,7 +73,7 @@ def YOLO():
     if metaMain is None:
         metaMain = darknet.load_meta(metaPath.encode("ascii"))
 
-    picked_up = 0
+    
     imageHub = imagezmq.ImageHub()
     frameDict = {}
     lastActive = {}
@@ -90,10 +87,7 @@ def YOLO():
     mW = 2
     mH = 2
     
-    max_sector_offset = 30
-
-
-    action_controller = ActionController()
+    
 
     cv2.namedWindow("Preview")
     print("Starting the YOLO loop...")
@@ -105,6 +99,9 @@ def YOLO():
         prev_time = time.time()
         pickup_timer+=1
         (rpiName, frame_read) = imageHub.recv_image()
+
+        
+
 
         left_border = AreaBorder('vertical', frame_width/2 - max_sector_offset, 1)
         right_border = AreaBorder('vertical', frame_width/2 + max_sector_offset, 1)
@@ -135,11 +132,14 @@ def YOLO():
         detections = darknet.detect_image(network, class_names, darknet_image, thresh=0.25)    # Detection occurs at this line and return detections, for customize we can change the threshold.                                                                                   
         custom_detections = []
         for det in detections:
-            if det[0] in robots[rpiName]["targets"]:
-                custom_detections.append(det)
-        print(len(custom_detections))
+            if robots[rpiName]["picked_up"] < robots[rpiName]["capacity"]:
+                if det[0] in robots[rpiName]["targets"]:
+                    custom_detections.append(det)
+            else:
+                if det[0] == robots[rpiName]["dispose_at"]:
+                    custom_detections.append(det)
         custom_detections = tuple(custom_detections)
-        print(len(custom_detections))
+
         if len(custom_detections):
             for det in custom_detections:
                 if det[0] in robots[rpiName]["targets"]:
@@ -231,6 +231,7 @@ def YOLO():
                                    int(prediction[1] + (0.5 * h))),
                                   (0,255,0),2)
 
+        
         if len(boxes)>0:     
             msg = ""   
             if prediction[0]<left_border.max_offset:
@@ -242,7 +243,7 @@ def YOLO():
                 if boxes[0][1] + (boxes[1][1] - boxes[0][1])/2 >(frame_height//4)*3:
                     msg = "PICKUP 0"
                     if pickup_timer>50:
-                        picked_up+=1
+                        robots[rpiName]["picked_up"]+=1
                     pickup_timer=0
                 else:
                     msg = "FORWARD " + str(abs(int(frame_height - prediction[1])))
@@ -270,12 +271,10 @@ def YOLO():
             cv2.imshow("Preview",
                 image)
 
-        #print(1/(time.time()-prev_time))
+        print(1/(time.time()-prev_time))
 
         # if the `q` key was pressed, break from the loop
         if cv2.waitKey(1) & 0xFF == ord('q'): break
-    
-                                                                   # For releasing cap and out. 
 
 if __name__ == "__main__":  
     YOLO()                                                           # Calls the main function YOLO()
