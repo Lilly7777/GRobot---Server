@@ -1,2 +1,2 @@
 # GRobot---Server
-Made with love, powered with AI
+Made with love. Powered with AI.
